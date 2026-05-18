@@ -1,0 +1,41 @@
+name: build-and-deploy
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  REGISTRY: registry.codelab.tec.br
+  IMAGE: registry.codelab.tec.br/vctrtvfrrr/telegram-obsidian-sync
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    container:
+      image: catthehacker/ubuntu:act-latest
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+        - /opt/compose:/opt/compose
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Registry login
+        run: echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "${REGISTRY}" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Build image
+        run: |
+          docker build \
+            -t "${IMAGE}:${{ github.ref_name }}" \
+            -t "${IMAGE}:latest" \
+            .
+
+      - name: Push image
+        run: |
+          docker push "${IMAGE}:${{ github.ref_name }}"
+          docker push "${IMAGE}:latest"
+
+      - name: Deploy
+        run: |
+          docker compose -f /opt/compose/telegram-obsidian-sync/compose.yml pull
+          docker compose -f /opt/compose/telegram-obsidian-sync/compose.yml up -d --force-recreate
