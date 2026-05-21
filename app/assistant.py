@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from typing import Any, Optional
 
 import anthropic
+import httpx
 
 from app.config import settings
 from app.session import Session, session_manager
@@ -27,7 +29,8 @@ Process each user message and decide the appropriate action:
 - "Start over" / "reset" → clear note content, keep session (action: clear_note)
 
 Always use the process_message tool. Never respond with plain text.
-For note content, always write complete Obsidian Markdown including a level-1 heading title.\
+For note content, always write complete Obsidian Markdown including a level-1 heading title.
+The "Current note content" block in the system context is background reference only — never copy it verbatim into note_content.\
 """
 
 CLOSE_SYSTEM_PROMPT = """\
@@ -159,11 +162,16 @@ class Assistant:
         now_iso = datetime.now(timezone.utc).isoformat()
         session.messages.append({"role": "user", "content": text, "timestamp": now_iso})
 
-        # Read current note content for context
+        # Read current note and refresh SHA to avoid stale-SHA conflicts
         current_note: str = ""
-        if session.note_path and session.note_sha:
+        if session.note_path:
             try:
-                current_note = await gitea.read_text(session.note_path) or ""
+                file_data = await gitea.get_file(session.note_path)
+                if file_data:
+                    current_note = base64.b64decode(
+                        file_data["content"].replace("\n", "")
+                    ).decode("utf-8")
+                    session.note_sha = file_data["sha"]
             except Exception:
                 logger.warning("Could not read current note: %s", session.note_path)
 
@@ -203,16 +211,30 @@ class Assistant:
 
         if action in ("update_note", "update_note_and_reply"):
             if note_content:
-                updated_data = await self._upsert_note(session, note_content)
-                session.note_sha = updated_data
-                assistant_summary_parts.append(f"[Note updated]")
+                try:
+                    updated_data = await self._upsert_note(session, note_content)
+                    session.note_sha = updated_data
+                    assistant_summary_parts.append("[Note updated]")
+                except Exception:
+                    logger.warning("Failed to upsert note for chat_id=%s", session.chat_id)
+                    await bot.send_message(
+                        chat_id=session.chat_id,
+                        text="⚠️ Could not save note. Please try again.",
+                    )
 
         if action == "clear_note":
             cleared_content = "*(note cleared)*\n"
-            sha = await self._upsert_note(session, cleared_content)
-            session.note_sha = sha
-            assistant_summary_parts.append("[Note cleared]")
-            reply_text = reply_text or "Note cleared. Send new content to start fresh."
+            try:
+                sha = await self._upsert_note(session, cleared_content)
+                session.note_sha = sha
+                assistant_summary_parts.append("[Note cleared]")
+                reply_text = reply_text or "Note cleared. Send new content to start fresh."
+            except Exception:
+                logger.warning("Failed to clear note for chat_id=%s", session.chat_id)
+                await bot.send_message(
+                    chat_id=session.chat_id,
+                    text="⚠️ Could not clear note. Please try again.",
+                )
 
         if action in ("reply", "update_note_and_reply", "clear_note") and reply_text:
             await bot.send_message(chat_id=session.chat_id, text=reply_text)
@@ -227,13 +249,29 @@ class Assistant:
     async def _upsert_note(self, session: Session, content: str) -> str:
         """Create or update the session note. Returns new SHA."""
         if not session.note_sha:
-            # Create new
             result = await gitea.create_file(
                 session.note_path, content, f"note: create {session.note_path}"
             )
             return result["content"]["sha"]
-        else:
-            # Update existing
+
+        try:
+            result = await gitea.update_file(
+                session.note_path, content, session.note_sha, f"note: update {session.note_path}"
+            )
+            return result["content"]["sha"]
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 409:
+                raise
+            # SHA stale — re-fetch and retry once
+            logger.warning(
+                "SHA conflict for %s (chat_id=%s), re-fetching and retrying",
+                session.note_path,
+                session.chat_id,
+            )
+            file_data = await gitea.get_file(session.note_path)
+            if file_data is None:
+                raise
+            session.note_sha = file_data["sha"]
             result = await gitea.update_file(
                 session.note_path, content, session.note_sha, f"note: update {session.note_path}"
             )
