@@ -223,6 +223,16 @@ class SessionManager:
         if task is not None and not task.done():
             task.cancel()
 
+    async def get_all_active_chat_ids(self) -> list[int]:
+        """Return chat_ids of all currently active sessions."""
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT chat_id FROM sessions WHERE status = 'active'"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [row["chat_id"] for row in rows]
+
     async def get_abandoned_chat_ids(self) -> list[int]:
         """Return chat_ids of active sessions inactive longer than abandon_timeout_seconds."""
         cutoff = datetime.now(timezone.utc).timestamp() - settings.abandon_timeout_seconds

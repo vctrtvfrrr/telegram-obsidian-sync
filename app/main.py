@@ -68,7 +68,18 @@ async def _debounce_close(chat_id: int, reason: str) -> None:
     if session is None:
         return
     bot: Bot = _ptb_app.bot  # type: ignore[union-attr]
-    await assistant.close_session(session, bot, reason=reason)
+    try:
+        await assistant.close_session(session, bot, reason=reason)
+    except Exception:
+        logger.exception("close_session failed for chat_id=%s", chat_id)
+        await session_manager.mark_closed(chat_id, "error")
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Erro ao finalizar sessão. Rascunho em: {session.note_path}",
+            )
+        except Exception:
+            logger.exception("Failed to notify user of close error chat_id=%s", chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +362,17 @@ async def lifespan(app: FastAPI):
         logger.info("Webhook set to %s", settings.webhook_url)
     except Exception:
         logger.exception("Failed to set webhook")
+
+    # Close sessions left active from a previous process
+    orphaned_ids = await session_manager.get_all_active_chat_ids()
+    for _chat_id in orphaned_ids:
+        _session = await session_manager.get_session(_chat_id)
+        if _session is not None:
+            logger.info("Closing orphaned session for chat_id=%s at startup", _chat_id)
+            asyncio.create_task(
+                assistant.close_session(_session, _ptb_app.bot, reason="restart"),
+                name=f"startup-close-{_chat_id}",
+            )
 
     # Start abandon-timeout background task
     abandon_task = asyncio.create_task(_abandon_watcher(), name="abandon-watcher")
