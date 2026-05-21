@@ -53,15 +53,7 @@ async def _get_or_create_session(chat_id: int) -> Session:
         return session
 
     path = inbox_path()
-    # Create empty note placeholder
-    try:
-        result = await gitea.create_file(path, "", f"note: start session {chat_id}")
-        sha: str = result["content"]["sha"]
-    except Exception:
-        logger.exception("Failed to create inbox note for chat_id=%s", chat_id)
-        sha = ""
-
-    session = await session_manager.create_session(chat_id, path, sha)
+    session = await session_manager.create_session(chat_id, path, "")
     return session
 
 
