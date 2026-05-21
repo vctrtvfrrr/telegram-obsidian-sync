@@ -38,7 +38,7 @@ You are an intelligent secretary finalizing an Obsidian vault note captured via 
 
 Analyze the entire conversation and produce structured output for the close_session tool:
 - Choose the best destination: inbox, recurso (web resource/link), tarefa (task/todo), or ideia (idea/thought)
-- Write the complete, polished final note in Obsidian Markdown
+- Write the polished note body in note_content — plain Obsidian Markdown paragraphs/lists only; no frontmatter, no H1 heading (those are added automatically)
 - Generate a short slug (MMDD-short-title format, e.g. "0517-artigo-sobre-ia")
 - Extract relevant tags
 - For recurso: include the URL
@@ -92,7 +92,7 @@ CLOSE_SESSION_TOOL: dict[str, Any] = {
             },
             "note_content": {
                 "type": "string",
-                "description": "Full final note content in Obsidian Markdown.",
+                "description": "Body content of the note in Obsidian Markdown. Do NOT include frontmatter or the H1 title heading — those are added automatically from the title, tags, and url fields.",
             },
             "tags": {
                 "type": "array",
