@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
-from telegram import Bot, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -18,8 +22,9 @@ from telegram.ext import (
 
 from app.assistant import assistant
 from app.config import settings
+from app.enrichment import describe_image, fetch_link_content, transcribe_audio
 from app.handlers.media import handle_media
-from app.session import Session, session_manager
+from app.session import PendingEnrichment, Session, session_manager
 from app.vault.gitea import gitea
 from app.vault.writer import inbox_path
 
@@ -27,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 # Module-level reference to the PTB Application (set during lifespan startup)
 _ptb_app: Application | None = None
+
+_URL_RE = re.compile(r"https?://[^\s<>\"']+[^\s<>\"'.,;!?)]")
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +87,74 @@ async def _debounce_close(chat_id: int, reason: str) -> None:
             )
         except Exception:
             logger.exception("Failed to notify user of close error chat_id=%s", chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Enrichment helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_enrichment_keyboard(enrichment_id: str, label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(label, callback_data=f"enrich:ok:{enrichment_id}"),
+                InlineKeyboardButton("⏭ Pular", callback_data=f"enrich:skip:{enrichment_id}"),
+            ]
+        ]
+    )
+
+
+async def _run_enrichment(pending: PendingEnrichment, bot: Any) -> str:
+    """Execute the enrichment pipeline and return the result block."""
+    if pending.enrichment_type == "image":
+        tg_file = await bot.get_file(pending.file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+        description = await describe_image(data, pending.mime_type or "image/jpeg")
+        return f"> **Descrição:** {description}" if description else ""
+
+    if pending.enrichment_type == "voice":
+        tg_file = await bot.get_file(pending.file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+        transcript = await transcribe_audio(data, pending.mime_type or "audio/ogg")
+        return f"> **Transcrição:** {transcript}" if transcript else ""
+
+    if pending.enrichment_type == "link":
+        content = await fetch_link_content(pending.url or "")
+        return f"> **Conteúdo:** {content}" if content else ""
+
+    return ""
+
+
+async def _append_to_note(session: Session, block: str) -> str:
+    """Append a text block to the session note. Returns new SHA."""
+    file_data = await gitea.get_file(session.note_path)
+    if file_data is None:
+        raise ValueError(f"Note not found: {session.note_path}")
+    current = base64.b64decode(file_data["content"].replace("\n", "")).decode("utf-8")
+    sha = file_data["sha"]
+    new_content = current.rstrip("\n") + "\n\n" + block + "\n"
+    result = await gitea.update_file(
+        session.note_path, new_content, sha, f"note: enrich {session.note_path}"
+    )
+    return result["content"]["sha"]
+
+
+async def _offer_enrichment(
+    chat_id: int,
+    pending: PendingEnrichment,
+    prompt: str,
+    button_label: str,
+) -> None:
+    """Send enrichment inline keyboard and register the pending enrichment."""
+    enrichment_id = str(uuid.uuid4())
+    bot: Bot = _ptb_app.bot  # type: ignore[union-attr]
+    await bot.send_message(
+        chat_id=chat_id,
+        text=prompt,
+        reply_markup=_make_enrichment_keyboard(enrichment_id, button_label),
+    )
+    session_manager.add_pending_enrichment(enrichment_id, pending)
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +309,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await assistant.process_message(session, text, _ptb_app.bot)  # type: ignore[union-attr]
     session_manager.schedule_debounce(chat_id)
 
+    # Offer link enrichment for any URLs in the message
+    urls = list(dict.fromkeys(_URL_RE.findall(text)))  # deduplicated, order preserved
+    for url in urls:
+        pending = PendingEnrichment(
+            chat_id=chat_id,
+            enrichment_type="link",
+            file_id=None,
+            url=url,
+            mime_type=None,
+        )
+        await _offer_enrichment(
+            chat_id,
+            pending,
+            prompt=f"🔗 Quero buscar o conteúdo deste link:\n{url}\n\nDeseja?",
+            button_label="📥 Buscar",
+        )
+
 
 async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id  # type: ignore[union-attr]
@@ -243,7 +335,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
     session = await _get_or_create_session(chat_id)
 
     try:
-        obsidian_ref = await handle_media(
+        obsidian_ref, pending = await handle_media(
             update, session, session_manager, _ptb_app.bot  # type: ignore[union-attr]
         )
     except Exception:
@@ -283,7 +375,81 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             logger.exception("Failed to update note with media ref for chat_id=%s", chat_id)
 
+    # Offer enrichment if applicable
+    if pending is not None:
+        if pending.enrichment_type == "image":
+            prompt = "🔍 Quero analisar e descrever esta imagem. Deseja?"
+            label = "🔍 Analisar"
+        else:  # voice
+            if not settings.openai_api_key:
+                prompt = None  # transcription unavailable without API key
+                label = ""
+            else:
+                prompt = "🎙 Quero transcrever este áudio. Deseja?"
+                label = "🎙 Transcrever"
+
+        if prompt:
+            await _offer_enrichment(chat_id, pending, prompt=prompt, button_label=label)
+
     session_manager.schedule_debounce(chat_id)
+
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses for enrichment confirmation."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    if not data.startswith("enrich:"):
+        return
+
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return
+    _, action, enrichment_id = parts
+
+    chat_id = query.message.chat.id  # type: ignore[union-attr]
+    if not _is_allowed(chat_id):
+        return
+
+    pending = session_manager.pop_pending_enrichment(enrichment_id)
+    if pending is None:
+        await query.edit_message_text("⚠️ Ação expirada.")
+        return
+
+    if action == "skip":
+        await query.edit_message_text("⏭ Ignorado")
+        return
+
+    # action == "ok"
+    await query.edit_message_text("⏳ Processando…")
+
+    try:
+        enrichment_block = await _run_enrichment(pending, _ptb_app.bot)  # type: ignore[union-attr]
+    except Exception:
+        logger.exception("Enrichment pipeline failed for chat_id=%s", pending.chat_id)
+        await query.edit_message_text("❌ Falhou ao processar.")
+        return
+
+    if not enrichment_block:
+        await query.edit_message_text("⚠️ Nenhum conteúdo extraído.")
+        return
+
+    session = await session_manager.get_session(pending.chat_id)
+    if session is None:
+        await query.edit_message_text("⚠️ Sessão já encerrada — conteúdo não salvo.")
+        return
+
+    try:
+        new_sha = await _append_to_note(session, enrichment_block)
+        session.note_sha = new_sha
+        await session_manager.update_session(session)
+        await query.edit_message_text("✅ Conteúdo adicionado à nota.")
+    except Exception:
+        logger.exception("Failed to append enrichment to note for chat_id=%s", pending.chat_id)
+        await query.edit_message_text("❌ Falhou ao salvar na nota.")
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +514,7 @@ async def lifespan(app: FastAPI):
             handle_media_message,
         )
     )
+    _ptb_app.add_handler(CallbackQueryHandler(handle_callback_query, pattern=r"^enrich:"))
 
     # Initialize and start PTB
     await _ptb_app.initialize()

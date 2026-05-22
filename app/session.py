@@ -25,6 +25,15 @@ class Session:
     status: str = "active"
 
 
+@dataclass
+class PendingEnrichment:
+    chat_id: int
+    enrichment_type: str  # "image", "voice", "link"
+    file_id: str | None   # Telegram file_id for media enrichments
+    url: str | None       # URL for link enrichments
+    mime_type: str | None
+
+
 CloseCallbackType = Callable[[int, str], Coroutine[Any, Any, None]]
 
 
@@ -33,6 +42,8 @@ class SessionManager:
         self._db_path = settings.db_path
         self._debounce_tasks: dict[int, asyncio.Task] = {}
         self._close_callback: Optional[CloseCallbackType] = None
+        # Keyed by enrichment UUID; no persistence needed
+        self._pending_enrichments: dict[str, PendingEnrichment] = {}
 
     def set_close_callback(self, fn: CloseCallbackType) -> None:
         self._close_callback = fn
@@ -222,6 +233,16 @@ class SessionManager:
         task = self._debounce_tasks.pop(chat_id, None)
         if task is not None and not task.done():
             task.cancel()
+
+    # ------------------------------------------------------------------
+    # Pending enrichment helpers
+    # ------------------------------------------------------------------
+
+    def add_pending_enrichment(self, enrichment_id: str, enrichment: PendingEnrichment) -> None:
+        self._pending_enrichments[enrichment_id] = enrichment
+
+    def pop_pending_enrichment(self, enrichment_id: str) -> PendingEnrichment | None:
+        return self._pending_enrichments.pop(enrichment_id, None)
 
     async def get_all_active_chat_ids(self) -> list[int]:
         """Return chat_ids of all currently active sessions."""

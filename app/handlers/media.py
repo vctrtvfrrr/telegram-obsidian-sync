@@ -8,7 +8,7 @@ from typing import Any
 import pytz
 
 from app.config import settings
-from app.session import Session, SessionManager
+from app.session import PendingEnrichment, Session, SessionManager
 from app.vault.gitea import gitea
 
 logger = logging.getLogger(__name__)
@@ -74,19 +74,21 @@ async def handle_media(
     session: Session,
     session_manager: SessionManager,
     bot: Any,
-) -> str:
-    """
-    Download media from Telegram, upload to Gitea as an asset, and return
-    an Obsidian-style reference string.
+) -> tuple[str, PendingEnrichment | None]:
+    """Download media from Telegram, upload to Gitea as an asset.
+
+    Returns (obsidian_ref, pending_enrichment).
+    pending_enrichment is non-None when the media type supports enrichment and
+    the user should be asked before processing (image without caption, voice).
     """
     msg = update.effective_message
     media_label, mime_type = _media_type_label(update)
     filename_hint: str | None = None
+    enrichment: PendingEnrichment | None = None
 
     # Determine file_id and optional filename hint
     if msg.photo:
-        # Choose highest resolution
-        file_id = msg.photo[-1].file_id
+        file_id = msg.photo[-1].file_id  # highest resolution
     elif msg.video:
         file_id = msg.video.file_id
         filename_hint = msg.video.file_name
@@ -101,7 +103,7 @@ async def handle_media(
         file_id = msg.audio.file_id
         filename_hint = msg.audio.file_name
     else:
-        return ""
+        return "", None
 
     ext = _resolve_extension(mime_type, filename_hint)
     now = _local_now()
@@ -123,7 +125,28 @@ async def handle_media(
         logger.exception("Failed to upload media to Gitea: %s", exc)
         raise
 
-    # Return Obsidian-style reference
+    # Build Obsidian reference
     is_image = mime_type in _IMAGE_MIMES if mime_type else media_label == "photo"
     obsidian_ref = f"![[assets/{asset_filename}]]" if is_image else f"[[assets/{asset_filename}]]"
-    return obsidian_ref
+
+    # Determine if enrichment should be offered
+    has_caption = bool(msg.caption)
+    if msg.photo and not has_caption:
+        enrichment = PendingEnrichment(
+            chat_id=session.chat_id,
+            enrichment_type="image",
+            file_id=file_id,
+            url=None,
+            mime_type=mime_type or "image/jpeg",
+        )
+    elif msg.voice:
+        enrichment = PendingEnrichment(
+            chat_id=session.chat_id,
+            enrichment_type="voice",
+            file_id=file_id,
+            url=None,
+            mime_type=mime_type or "audio/ogg",
+        )
+    # audio (music files) and video/document: no enrichment offered
+
+    return obsidian_ref, enrichment

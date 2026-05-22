@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     gitea_vault_repo: str
     gitea_token: str
     anthropic_api_key: str
+    openai_api_key: str | None = None
     note_timezone: str = "America/Sao_Paulo"
 
     db_path: str = "/data/db.sqlite"
