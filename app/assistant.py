@@ -438,14 +438,17 @@ class Assistant:
         # Mark session closed
         await session_manager.mark_closed(session.chat_id, "closed")
         _instructions_cache.pop(session.chat_id, None)
-        session_manager.cancel_debounce(session.chat_id)
 
-        # Notify user
+        # Notify user before cancelling the debounce task — cancel_debounce calls
+        # task.cancel() which injects CancelledError at the next await, so the
+        # send_message must happen first.
         resume_hint = f" · /resume {slug}" if slug else ""
         await bot.send_message(
             chat_id=session.chat_id,
             text=f"✅ Saved to {destination}{resume_hint}",
         )
+
+        session_manager.cancel_debounce(session.chat_id)
 
 
 assistant = Assistant()
